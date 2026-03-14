@@ -1,0 +1,430 @@
+---
+title: "Stochastic HPLC"
+subtitle: "First-Passage Animation + Chromatogram of interconverting species"
+format:
+  dashboard:
+    scrolling: true
+    orientation: rows
+    theme: cosmo
+server: shiny
+---
+
+```{r}
+#| context: setup
+#| include: false
+library(shiny)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(av)
+library(ragg)
+```
+
+# Controls {.sidebar}
+
+```{r}
+actionButton("run", "Run simulation", class = "btn-primary")
+sliderInput("N", "Particles (N)", min = 100, max = 1000, value = 500, step = 50)
+sliderInput("L", "Column length", min = 10, max = 50, value = 20, step = 10)
+sliderInput("v", "Flow rate / drift", min = 0.1, max = 1.0, value = 0.1, step = 0.1)
+sliderInput("Dax", "Axial dispersion", min = 0.00, max = 0.10, value = 0.01, step = 0.01)
+sliderInput("tau_M1", "Mean fly time (species 1)", min = 0.05, max = 1.00, value = 0.80, step = 0.05)
+sliderInput("tau_S1", "Mean sojourn time (species 1)", min = 0.05, max = 1.00, value = 0.05, step = 0.05)
+sliderInput("tau_M2", "Mean fly time (species 2)", min = 0.05, max = 1.00, value = 0.05, step = 0.05)
+sliderInput("tau_S2", "Mean sojourn time (species 2)", min = 0.05, max = 1.00, value = 0.80, step = 0.05)
+sliderInput("k12", "1→2 conversion rate constant", min = 0.00, max = 0.05, value = 0.00, step = 0.01)
+sliderInput("k21", "2→1 conversion rate constant", min = 0.00, max = 0.05, value = 0.00, step = 0.01)
+sliderInput("temp_scl", "Temporal resolution scale", min = 1, max = 100, value = 50, step = 1)
+```
+
+```{r}
+#| context: server
+
+simulate_hplc_fpt_2spec_interconv <- reactive({
+  function(
+    N, L, v, Dax,
+    tau_M1, tau_S1,
+    tau_M2, tau_S2,
+    k12, k21,
+    temp_scl) {
+    
+    set.seed(1)
+    
+    # column
+    ID  <- 0.5
+    eps <- 0.7
+    S   <- pi * ID^2 / 4
+    u   <- (v / S) / eps
+    
+    t0 <- L / u
+    n  <- t0 / min(tau_M1, tau_M2)
+    m2 <- 2 * n * max(tau_S1, tau_S2)^2
+    dt <- round(sqrt(m2) / temp_scl, 3)
+    
+    # state (single pool)
+    t      <- 0
+    x      <- rep(0, N)
+    alive  <- rep(TRUE, N)
+    mobile <- rep(TRUE, N)
+    fpt    <- rep(NA_real_, N)
+    
+    # species label: 1 or 2
+    species <- rep(c(1L, 2L), each = N / 2)
+    
+    # per-step interconversion probabilities (from rates)
+    p12 <- 1 - exp(-k12 * dt)
+    p21 <- 1 - exp(-k21 * dt)
+    
+    # history (store both x and species for animate)
+    x_hist       <- matrix(unname(x), nrow = 1)
+    species_hist <- matrix(species, nrow = 1)
+    
+    n_alive_total <- N
+    while (n_alive_total > 0) {
+      t <- t + dt
+      
+      idx <- which(alive)
+      if (!length(idx)) break
+      
+      # ---- (A) interconversion: 1 <-> 2 on alive particles ----
+      sp <- species[idx]
+      r  <- runif(length(idx))
+      
+      to2 <- which(sp == 1L & r < p12)
+      if (length(to2)) species[idx[to2]] <- 2L
+      
+      to1 <- which(sp == 2L & r < p21)
+      if (length(to1)) species[idx[to1]] <- 1L
+      
+      # ---- (B) update switching probabilities based on species ----
+      # vectorized per-particle probs for alive particles
+      p_off_mobile <- ifelse(species[idx] == 1L,
+                             1 - exp(-dt / tau_M1),
+                             1 - exp(-dt / tau_M2))
+      
+      p_off_stat   <- ifelse(species[idx] == 1L,
+                             1 - exp(-dt / tau_S1),
+                             1 - exp(-dt / tau_S2))
+      
+      # ---- (C) mobile <-> stationary switching ----
+      m <- mobile[idx]
+      
+      r1 <- runif(length(idx))
+      sw_m2s <- which(m & (r1 < p_off_mobile))
+      if (length(sw_m2s)) mobile[idx[sw_m2s]] <- FALSE
+      
+      r2 <- runif(length(idx))
+      sw_s2m <- which(!m & (r2 < p_off_stat))
+      if (length(sw_s2m)) mobile[idx[sw_s2m]] <- TRUE
+      
+      # ---- (D) motion (recompute mobile after switching) ----
+      idx_move <- idx[ mobile[idx] ]
+      if (length(idx_move)) {
+        x[idx_move] <- x[idx_move] + u * dt + sqrt(2 * Dax * dt) * rnorm(length(idx_move))
+        x[idx_move] <- pmax(x[idx_move], 0)
+      }
+      
+      # ---- (E) absorption ----
+      hit <- idx[ x[idx] >= L ]
+      if (length(hit)) {
+        alive[hit] <- FALSE
+        fpt[hit]   <- t
+        x[hit]     <- L
+        n_alive_total <- n_alive_total - length(hit)
+      }
+      
+      # history
+      x_hist       <- rbind(x_hist, unname(x))
+      species_hist <- rbind(species_hist, species)
+    }
+    
+    list(
+      dt = dt,
+      x_hist = x_hist,
+      species_hist = species_hist,
+      fpt = fpt
+    )
+  }
+})
+
+hist_to_df_interconv <- reactive({
+  function(
+    x_hist,
+    species_hist,
+    dt, N, L) {
+    
+    total_steps <- nrow(x_hist)
+    frames <- total_steps
+    
+    frame_idx <- unique(round(seq(1, total_steps, length.out = frames)))
+    frame_idx <- pmin(pmax(frame_idx, 1), total_steps)
+    
+    # fixed lane per particle (shared across species changes)
+    y_lane <- runif(N, -0.45, 0.45)
+    
+    df <- tibble(
+      frame = rep(seq_along(frame_idx), each = N),
+      t     = rep((frame_idx - 1) * dt, each = N),
+      id    = rep(seq_len(N), times = length(frame_idx)),
+      x     = as.vector(t(x_hist[frame_idx, , drop = FALSE])),
+      sp    = as.vector(t(species_hist[frame_idx, , drop = FALSE])),
+      y     = rep(y_lane, times = length(frame_idx))
+    ) %>%
+      mutate(
+        species  = if_else(sp == 1L, "sp1", "sp2"),
+        absorbed = x >= (L - 1e-12)
+      ) %>%
+      select(-sp)
+    
+    df
+  }
+})
+
+N        <- reactive({input$N})
+L        <- reactive({input$L})
+v        <- reactive({input$v})
+Dax      <- reactive({input$Dax})
+tau_M1   <- reactive({input$tau_M1})
+tau_S1   <- reactive({input$tau_S1})
+tau_M2   <- reactive({input$tau_M2})
+tau_S2   <- reactive({input$tau_S2})
+k12      <- reactive({input$k12})
+k21      <- reactive({input$k21})
+temp_scl <- reactive({input$temp_scl})
+
+s <- eventReactive(input$run, {
+  simulate_hplc_fpt_2spec_interconv()(
+    N(), L(), v(), Dax(),
+    tau_M1(), tau_S1(),
+    tau_M2(), tau_S2(),
+    k12(), k21(),
+    temp_scl()
+  )
+})
+
+dt           <- reactive({s()[[1]]})
+x_hist       <- reactive({s()[[2]]})
+species_hist <- reactive({s()[[3]]})
+fpt          <- reactive({s()[[4]]})
+
+df <- reactive({
+  hist_to_df_interconv()(
+    x_hist(), species_hist(),
+    dt(), N(), L()
+  )
+})
+
+nframes <- reactive({max(df()$frame)})
+
+df_fpt <- reactive({
+  tibble(
+    id  = seq_len(N()),
+    fpt = fpt(),
+    sp  = species_hist()[nrow(species_hist()), ]
+  ) %>%
+    filter(is.finite(fpt)) %>%
+    mutate(species = if_else(sp == 1L, "sp1", "sp2")) %>%
+    select(species, fpt)
+
+})
+
+x1     <- reactive({df_fpt()$fpt[df_fpt()$species == "sp1"]})
+x2     <- reactive({df_fpt()$fpt[df_fpt()$species == "sp2"]})
+x_all  <- reactive({c(x1(), x2())})
+grid_n <- reactive({1024})
+from   <- reactive({0})
+to     <- reactive({max(x_all())})
+
+bw_shared <- reactive({
+  density(x_all(), n = grid_n(), from = from(), to = to())$bw
+})
+
+d1 <- reactive({
+  density(x1(), bw = bw_shared(), n = grid_n(), from = from(), to = to(), adjust = 0.5)
+})
+d2 <- reactive({
+  density(x2(), bw = bw_shared(), n = grid_n(), from = from(), to = to(), adjust = 0.5)
+})
+
+df_sum <- reactive({
+  tibble(
+    fpt      = d1()$x,
+    dens_sum = d1()$y + d2()$y
+  )
+})
+
+output$chromPlot <- renderPlot({
+  df_fpt <- df_fpt()
+  df_sum <- df_sum()
+  ggplot(df_fpt, aes(x = fpt, colour = species, fill = species)) +
+    geom_histogram(aes(y = after_stat(density)),
+                   bins = 60, alpha = 0.20, position = "identity") +
+    geom_line(data = df_sum, aes(x = fpt, y = dens_sum),
+              inherit.aes = FALSE, colour = "black", linewidth = 1) +
+    scale_fill_manual(values = c(
+      sp1 = "#ff00cc",
+      sp2 = "#339900"
+    )) +
+    scale_colour_manual(values = c(
+      sp1 = "#ff00cc",
+      sp2 = "#339900"
+    )) +
+    coord_cartesian(xlim = c(0, to()), expand = FALSE) +
+    theme_minimal(base_size = 12) +
+    labs(
+      title = "Chromatogram proxy: species densities + kernel density estimate of sum",
+      x = "First passage time",
+      y = "Density"
+    )
+})
+
+addResourcePath("media", tempdir())
+
+render_particles_mp4 <- function(df, L, fps = 5, width = 900, height = 240) {
+  frames_dir <- file.path(tempdir(), paste0("frames_", as.integer(runif(1, 1, 1e9))))
+  dir.create(frames_dir, recursive = TRUE, showWarnings = FALSE)
+
+  frames <- sort(unique(df$frame))
+  nF <- length(frames)
+
+  # predefine colors
+  col_sp1 <- "#ff00cc"
+  col_sp2 <- "#339900"
+  outline <- "black"
+
+  # helper: apply alpha to hex color
+  hex_alpha <- function(hex, alpha01) {
+    rgbv <- grDevices::col2rgb(hex) / 255
+    grDevices::rgb(rgbv[1], rgbv[2], rgbv[3], alpha = alpha01)
+  }
+
+  # render PNG frames
+  for (i in seq_along(frames)) {
+    f <- frames[i]
+    d <- df[df$frame == f, , drop = FALSE]
+
+    # choose device: ragg; fallback to grDevices
+    png_file <- file.path(frames_dir, sprintf("frame_%05d.png", i))
+
+    if (requireNamespace("ragg", quietly = TRUE)) {
+      ragg::agg_png(png_file, width = width, height = height, units = "px", res = 96)
+    } else {
+      grDevices::png(png_file, width = width, height = height)
+    }
+
+    op <- par(mar = c(0.5, 0.5, 2, 0.5))
+    on.exit({ par(op); grDevices::dev.off() }, add = TRUE)
+
+    plot(NA, xlim = c(0, L), ylim = c(-0.6, 0.6), axes = FALSE, xlab = "", ylab = "")
+    rect(0, -0.55, L, 0.55, col = hex_alpha("#add8e6", 0.15), border = NA)
+
+    # per-point fill by species + alpha by absorbed
+    fill_base <- ifelse(d$species == "sp1", col_sp1, col_sp2)
+    a <- ifelse(d$absorbed, 0.25, 0.9)
+    fill <- mapply(hex_alpha, fill_base, a, SIMPLIFY = TRUE)
+
+    points(d$x, d$y, pch = 21, bg = fill, col = outline, cex = 1.2, lwd = 1)
+    title(main = sprintf("Particles in column — t = %.3f s", unique(d$t)[1L]))
+
+    grDevices::dev.off()
+  }
+
+  # encode MP4
+  mp4_file <- file.path(tempdir(), paste0("hplc_", as.integer(runif(1, 1, 1e9)), ".mp4"))
+  pngs <- list.files(frames_dir, pattern = "\\.png$", full.names = TRUE)
+
+  av::av_encode_video(pngs, output = mp4_file, framerate = fps)
+
+  mp4_file
+}
+
+mp4_path <- reactiveVal(NULL)
+
+observeEvent(input$run, {
+  req(df(), L())
+
+  withProgress(message = "Rendering MP4", value = 0, {
+    
+    df0 <- df()
+    L0  <- L()
+    frames <- sort(unique(df0$frame))
+    nF <- length(frames)
+
+    frames_dir <- file.path(tempdir(), paste0("frames_", as.integer(runif(1, 1, 1e9))))
+    dir.create(frames_dir, recursive = TRUE, showWarnings = FALSE)
+
+    col_sp1 <- "#ff00cc"
+    col_sp2 <- "#339900"
+    outline <- "black"
+
+    hex_alpha <- function(hex, alpha01) {
+      rgbv <- grDevices::col2rgb(hex) / 255
+      grDevices::rgb(rgbv[1], rgbv[2], rgbv[3], alpha = alpha01)
+    }
+
+    for (i in seq_along(frames)) {
+      incProgress(0.8 / nF, detail = sprintf("Frame %d / %d", i, nF))
+
+      f <- frames[i]
+      d <- df0[df0$frame == f, , drop = FALSE]
+      png_file <- file.path(frames_dir, sprintf("frame_%05d.png", i))
+
+      if (requireNamespace("ragg", quietly = TRUE)) {
+        ragg::agg_png(png_file, width = 900, height = 240, units = "px", res = 96)
+      } else {
+        grDevices::png(png_file, width = 900, height = 240)
+      }
+
+      op <- par(mar = c(0.5, 0.5, 2, 0.5))
+      plot(NA, xlim = c(0, L0), ylim = c(-0.6, 0.6), axes = FALSE, xlab = "", ylab = "")
+      rect(0, -0.55, L0, 0.55, col = hex_alpha("#add8e6", 0.15), border = NA)
+
+      fill_base <- ifelse(d$species == "sp1", col_sp1, col_sp2)
+      a <- ifelse(d$absorbed, 0.25, 0.9)
+      fill <- mapply(hex_alpha, fill_base, a, SIMPLIFY = TRUE)
+
+      points(d$x, d$y, pch = 21, bg = fill, col = outline, cex = 1.2, lwd = 1)
+      title(main = "Particles in column")
+
+      par(op)
+      grDevices::dev.off()
+    }
+
+    incProgress(0.15, detail = "Encoding MP4…")
+    mp4_file <- file.path(tempdir(), paste0("hplc_", as.integer(runif(1, 1, 1e9)), ".mp4"))
+    pngs <- list.files(frames_dir, pattern = "\\.png$", full.names = TRUE)
+    av::av_encode_video(pngs, output = mp4_file, framerate = 5)
+
+    incProgress(0.05, detail = "Finalizing…")
+    mp4_path(mp4_file)
+  })
+})
+
+output$anim_ui <- renderUI({
+  req(mp4_path())
+  src <- file.path("media", basename(mp4_path()))
+  tags$video(src = src, type = "video/mp4", controls = NA, autoplay = NA, loop = NA, width = "100%")
+})
+```
+
+# Outputs
+
+Parameters of the simulation can be set in the left sidebar, then press "Run simulation". A progress bar shows animation rendering.
+
+Initial parameters set no interconversion. After setting the desired retention parameters, interconversion can be achieved by adjusting conversion rate constants.
+
+Increase temporal resolution scale for a finer $\mathrm{d}t$ time grid during simulation of retention process.
+
+## Animation
+
+```{r}
+#| title: Animation of retention and interconversion process
+uiOutput("anim_ui")
+```
+
+## Smoothed FPT density (Chromatogram approximation)
+
+```{r}
+#| title: Histrogram of first passage times
+plotOutput("chromPlot")
+```
