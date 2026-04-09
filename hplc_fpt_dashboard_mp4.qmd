@@ -202,10 +202,10 @@ s <- eventReactive(input$run, {
   )
 })
 
-dt           <- reactive({s()[[1]]})
-x_hist       <- reactive({s()[[2]]})
-species_hist <- reactive({s()[[3]]})
-fpt          <- reactive({s()[[4]]})
+dt           <- reactive({s()[["dt"]]})
+x_hist       <- reactive({s()[["x_hist"]]})
+species_hist <- reactive({s()[["species_hist"]]})
+fpt          <- reactive({s()[["fpt"]]})
 
 df <- reactive({
   hist_to_df_interconv()(
@@ -279,64 +279,6 @@ output$chromPlot <- renderPlot({
 })
 
 addResourcePath("media", tempdir())
-
-render_particles_mp4 <- function(df, L, fps = 5, width = 900, height = 240) {
-  frames_dir <- file.path(tempdir(), paste0("frames_", as.integer(runif(1, 1, 1e9))))
-  dir.create(frames_dir, recursive = TRUE, showWarnings = FALSE)
-
-  frames <- sort(unique(df$frame))
-  nF <- length(frames)
-
-  # predefine colors
-  col_sp1 <- "#ff00cc"
-  col_sp2 <- "#339900"
-  outline <- "black"
-
-  # helper: apply alpha to hex color
-  hex_alpha <- function(hex, alpha01) {
-    rgbv <- grDevices::col2rgb(hex) / 255
-    grDevices::rgb(rgbv[1], rgbv[2], rgbv[3], alpha = alpha01)
-  }
-
-  # render PNG frames
-  for (i in seq_along(frames)) {
-    f <- frames[i]
-    d <- df[df$frame == f, , drop = FALSE]
-
-    # choose device: ragg; fallback to grDevices
-    png_file <- file.path(frames_dir, sprintf("frame_%05d.png", i))
-
-    if (requireNamespace("ragg", quietly = TRUE)) {
-      ragg::agg_png(png_file, width = width, height = height, units = "px", res = 96)
-    } else {
-      grDevices::png(png_file, width = width, height = height)
-    }
-
-    op <- par(mar = c(0.5, 0.5, 2, 0.5))
-    on.exit({ par(op); grDevices::dev.off() }, add = TRUE)
-
-    plot(NA, xlim = c(0, L), ylim = c(-0.6, 0.6), axes = FALSE, xlab = "", ylab = "")
-    rect(0, -0.55, L, 0.55, col = hex_alpha("#add8e6", 0.15), border = NA)
-
-    # per-point fill by species + alpha by absorbed
-    fill_base <- ifelse(d$species == "sp1", col_sp1, col_sp2)
-    a <- ifelse(d$absorbed, 0.25, 0.9)
-    fill <- mapply(hex_alpha, fill_base, a, SIMPLIFY = TRUE)
-
-    points(d$x, d$y, pch = 21, bg = fill, col = outline, cex = 1.2, lwd = 1)
-    title(main = sprintf("Particles in column — t = %.3f s", unique(d$t)[1L]))
-
-    grDevices::dev.off()
-  }
-
-  # encode MP4
-  mp4_file <- file.path(tempdir(), paste0("hplc_", as.integer(runif(1, 1, 1e9)), ".mp4"))
-  pngs <- list.files(frames_dir, pattern = "\\.png$", full.names = TRUE)
-
-  av::av_encode_video(pngs, output = mp4_file, framerate = fps)
-
-  mp4_file
-}
 
 mp4_path <- reactiveVal(NULL)
 
